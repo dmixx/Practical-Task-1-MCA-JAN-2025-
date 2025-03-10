@@ -1,0 +1,258 @@
+#include "stm32f4xx.h"
+#include "font5x7.h"
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define I2C_FREQ        100000UL    // 100 kHz I2C clock
+#define SYSCLK          168000000UL // Assume 168 MHz system clock (adjust if needed)
+#define OLED_ADDR       0x3C        // SSD1306 I2C address (7-bit)
+#define OLED_RESET_PIN  4           // PD4
+
+#define OLED_WIDTH      128
+#define OLED_HEIGHT     32
+#define OLED_PAGES      (OLED_HEIGHT / 8)
+
+// Display buffer: 128 columns x (32 rows / 8 pages) = 512 bytes
+uint8_t buffer[OLED_WIDTH * OLED_PAGES];
+
+// Simple busy-wait delay (approximate, in milliseconds)
+void delay_ms(uint32_t ms) {
+    volatile uint32_t count;
+    uint32_t i;
+    while (ms--) {
+        count = SYSCLK / 8000; // Adjust constant as needed
+        for (i = 0; i < count; i++) {
+            /* Do nothing */
+        }
+    }
+}
+
+// I2C1 initialization (polling, without HAL)
+void I2C1_Init(void) {
+    /* Enable clocks for I2C1 and GPIOB */
+    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    
+    /* Configure PB8 (SCL) and PB9 (SDA) as Alternate Function, Open-drain, Pull-up */
+    GPIOB->MODER &= ~((3UL << (8 * 2)) | (3UL << (9 * 2)));
+    GPIOB->MODER |= ((2UL << (8 * 2)) | (2UL << (9 * 2)));
+    GPIOB->OTYPER |= ((1UL << 8) | (1UL << 9));
+    GPIOB->OSPEEDR |= ((3UL << (8 * 2)) | (3UL << (9 * 2)));
+    GPIOB->PUPDR &= ~((3UL << (8 * 2)) | (3UL << (9 * 2)));
+    GPIOB->PUPDR |= ((1UL << (8 * 2)) | (1UL << (9 * 2)));
+    GPIOB->AFR[1] &= ~((0xFUL << (0 * 4)) | (0xFUL << (1 * 4)));
+    GPIOB->AFR[1] |= ((4UL << (0 * 4)) | (4UL << (1 * 4)));
+    
+    /* Reset I2C1 */
+    RCC->APB1RSTR |= RCC_APB1RSTR_I2C1RST;
+    delay_ms(1);
+    RCC->APB1RSTR &= ~RCC_APB1RSTR_I2C1RST;
+    
+    /* Disable I2C1 before configuration */
+    I2C1->CR1 &= ~I2C_CR1_PE;
+    I2C1->CR2 = 42;   /* Assume APB1 clock is 42 MHz */
+    I2C1->CCR = 210;  /* For 100 kHz: (42e6 / (100e3 * 2)) = 210 (approx.) */
+    I2C1->TRISE = 43; /* (42MHz / 1e6) + 1 = 43 */
+    I2C1->CR1 |= I2C_CR1_PE;
+}
+
+// I2C write function (blocking, polling)
+void I2C1_Write(uint8_t addr, uint8_t *data, uint16_t len) {
+    uint32_t timeout;
+    uint16_t i;
+    
+    I2C1->CR1 |= I2C_CR1_START;
+    timeout = 100000;
+    while (!(I2C1->SR1 & I2C_SR1_SB) && --timeout)
+        ;
+    
+    I2C1->DR = (addr << 1);
+    timeout = 100000;
+    while (!(I2C1->SR1 & I2C_SR1_ADDR) && --timeout)
+        ;
+    (void)I2C1->SR1;
+    (void)I2C1->SR2;
+    
+    for (i = 0; i < len; i++) {
+        timeout = 100000;
+        while (!(I2C1->SR1 & I2C_SR1_TXE) && --timeout)
+            ;
+        I2C1->DR = data[i];
+    }
+    
+    timeout = 100000;
+    while (!(I2C1->SR1 & I2C_SR1_BTF) && --timeout)
+        ;
+    
+    I2C1->CR1 |= I2C_CR1_STOP;
+}
+
+// Send OLED command (control byte 0x00)
+void oled_command(uint8_t cmd) {
+    uint8_t data[2];
+    data[0] = 0x00;
+    data[1] = cmd;
+    I2C1_Write(OLED_ADDR, data, 2);
+}
+
+// Update the OLED with the display buffer
+void update_display(void) {
+    uint8_t data[129];
+    uint8_t page;
+    
+    for (page = 0; page < OLED_PAGES; page++) {
+        oled_command(0xB0 + page);
+        oled_command(0x00);
+        oled_command(0x10);
+        
+        data[0] = 0x40;
+        memcpy(&data[1], &buffer[page * OLED_WIDTH], OLED_WIDTH);
+        I2C1_Write(OLED_ADDR, data, OLED_WIDTH + 1);
+    }
+}
+
+// OLED hardware reset using PD4 with BSRRL/BSRRH
+void oled_reset_display(void) {
+    /* Enable clock for GPIOD */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
+    
+    /* Configure PD4 as output (push-pull) */
+    GPIOD->MODER &= ~(3UL << (OLED_RESET_PIN * 2));
+    GPIOD->MODER |= (1UL << (OLED_RESET_PIN * 2));
+    GPIOD->OTYPER &= ~(1UL << OLED_RESET_PIN);
+    
+    /* Reset the OLED: set PD4 low, then high */
+    GPIOD->BSRRH = (1UL << OLED_RESET_PIN); // PD4 low
+    delay_ms(1);
+    GPIOD->BSRRL = (1UL << OLED_RESET_PIN); // PD4 high
+    delay_ms(100);
+}
+
+// Initialize the OLED with commands
+void init_oled(void) {
+    const uint8_t init_cmds[] = {
+        0xAE,       // Display OFF
+        0xD5, 0x80, // Set display clock divide ratio/oscillator frequency
+        0xA8, 0x1F, // Set multiplex ratio (32 rows)
+        0xD3, 0x00, // Set display offset
+        0x40,       // Set start line address
+        0x8D, 0x14, // Enable charge pump
+        0x20, 0x00, // Set memory addressing mode to horizontal
+        0xA1,       // Set segment re-map
+        0xC8,       // Set COM output scan direction (remapped)
+        0xDA, 0x02, // Set COM pins hardware configuration
+        0x81, 0x8F, // Set contrast control
+        0xD9, 0xF1, // Set pre-charge period
+        0xDB, 0x40, // Set VCOMH deselect level
+        0xA4,       // Entire display ON (resume to RAM content display)
+        0xA6,       // Set normal display (A7 for inverse)
+        0xAF        // Display ON
+    };
+    unsigned int j;
+    
+    oled_reset_display();
+    
+    for (j = 0; j < sizeof(init_cmds); j++) {
+        oled_command(init_cmds[j]);
+    }
+}
+
+// Draw a single character (5x7) into the display buffer at (x,y)
+void draw_char(uint8_t x, uint8_t y, char c) {
+    uint8_t index;
+    int i, j;
+    int px, py;
+    int page, bit;
+    
+    if (c < 32 || c > 127)
+        return;
+    index = (uint8_t)(c - 32);
+    
+    for (i = 0; i < 5; i++) {
+        uint8_t colData = font5x7[index][i];
+        for (j = 0; j < 7; j++) {
+            if (colData & (1 << j)) {
+                px = x + i;
+                py = y + j;
+                if (px >= OLED_WIDTH || py >= OLED_HEIGHT)
+                    continue;
+                page = py / 8;
+                bit = py % 8;
+                buffer[page * OLED_WIDTH + px] |= (1 << bit);
+            }
+        }
+    }
+}
+
+// Draw a null-terminated string starting at (x,y)
+void draw_text(uint8_t x, uint8_t y, const char* text) {
+    while (*text) {
+        draw_char(x, y, *text);
+        x += 6; // 5 pixels for character width plus 1 pixel spacing
+        text++;
+    }
+}
+
+// Clear the display buffer
+void clear_buffer(void) {
+    memset(buffer, 0, sizeof(buffer));
+}
+
+/* --- Switch (SW1) Setup on PA0 --- */
+// Configure PA0 as digital input with internal pull-up enabled.
+// Modify wiring or pull configuration as needed.
+void SW1_Init(void) {
+    // Enable clock for GPIOA
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    
+    // Configure PA0 as input (MODER bits 00)
+    GPIOA->MODER &= ~(3UL << (0 * 2));
+    
+    // Enable internal pull-up on PA0 (set PUPDR bits to 01)
+    GPIOA->PUPDR &= ~(3UL << (0 * 2));
+    GPIOA->PUPDR |=  (1UL << (0 * 2));
+}
+
+int main(void) {
+    // We'll store two lines of text depending on the switch state
+    char line1[32];
+    char line2[32];
+    uint8_t swState;
+
+    SystemInit();
+    
+    I2C1_Init();
+    SW1_Init();
+    
+    init_oled();
+    clear_buffer();
+    
+    while (1) {
+        // Read SW1 state on PA0:
+        // If pressed => 0, else => 1
+        swState = (GPIOA->IDR & (1UL << 0)) ? 1 : 0;
+        
+        clear_buffer();  // Clear entire screen buffer
+        
+        if (swState) {
+            // Switch released => Logic 1
+            // Show "Logic 1: 3.3 V" and "SW1 Released"
+            sprintf(line1, "Logic 1: 3.3V");
+            sprintf(line2, "SW1 Released");
+        } else {
+            // Switch pressed => Logic 0
+            // Show "Logic 0: 0 V" and "SW1 Pressed"
+            sprintf(line1, "Logic 0: 0V");
+            sprintf(line2, "SW1 Pressed");
+        }
+
+        // Draw line1 at row 0, line2 at row 16
+        draw_text(0, 0,  line1);
+        draw_text(0, 16, line2);
+
+        update_display();
+
+        delay_ms(300);
+    }
+}
